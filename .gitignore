@@ -1,0 +1,31 @@
+# 敏感配置文件
+config.yaml
+
+# 日志文件
+logs/
+*.log
+
+# Python缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 开发环境文件
+.env
+.venv
+env/
+venv/
+ENV/
+.idea/
+.vscode/
+.cursorrules
+tests/
+
+# 构建和分发
+dist/
+build/
+*.egg-info/ 

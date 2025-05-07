@@ -196,8 +196,12 @@ class DingTalkNotifier:
             logger.warning("钉钉webhook未配置，无法发送资产变更通知")
             return False
             
-        # 如果没有变更，不发送通知
-        if (sync_result.get("created", 0) == 0 and sync_result.get("updated", 0) == 0 and sync_result.get("deleted", 0) == 0):
+        # 检查同步状态和错误信息
+        success = sync_result.get('success', True)
+        error_message = sync_result.get('error_message', '')
+        
+        # 如果没有变更且没有错误，不发送通知
+        if not error_message and (sync_result.get("created", 0) == 0 and sync_result.get("updated", 0) == 0 and sync_result.get("deleted", 0) == 0 and sync_result.get("failed", 0) == 0):
             logger.info("没有资产变更，不发送通知")
             return True
         
@@ -207,24 +211,49 @@ class DingTalkNotifier:
         deleted = sync_result.get('deleted', 0)
         failed = sync_result.get('failed', 0)
         total = sync_result.get('total', 0)
+        expected_total = sync_result.get('expected_total', 0)
         duration = sync_result.get('duration', '0秒')
         
-        # 构建ActionCard标题 - 与截图完全一致
-        title = f"JMS资产同步通知"
+        # 构建ActionCard标题
+        title = "JMS资产同步通知"
+        if not success:
+            title = "JMS资产同步失败通知"
         
-        # 构建ActionCard内容 - 匹配截图样式
+        # 构建ActionCard内容
         content = ""
-        content += f"# JMS资产同步通知\n"
+        content += f"# JMS资产{'同步失败' if not success else '同步'}通知\n"
         content += f"### **云资产** {platform} - {cloud_name}\n\n"
         content += f"### **同步时间** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        
+        # 如果同步失败，优先显示错误信息
+        if not success and error_message:
+            content += "### **失败原因**\n\n"
+            content += f"{error_message}\n\n"
         
         # 同步结果部分
         content += "### **同步结果**\n\n"
         
-        # 使用表格展示结果数据 - 完全匹配截图样式
+        # 使用表格展示结果数据
         content += "| 指标 | 数值 |\n"
         content += "|---|---|\n"
         content += f"| 总计资产 | {total} 个 |\n"
+        
+        # 如果API返回总数与实际获取数量不同，显示对比信息
+        if expected_total > 0 and expected_total != total:
+            content += f"| API返回总数 | {expected_total} 个 |\n"
+            content += f"| 数量差异 | {expected_total - total} 个|\n"
+            
+            # 添加差异原因说明
+            if expected_total > total:
+                difference_percent = ((expected_total - total) / expected_total) * 100
+                content += f"| 差异比例 | {difference_percent:.2f}% |\n"
+                content += f"| 差异原因 | 实际获取数量少于API返回总数，可能是部分实例获取失败或存在无效实例 |\n"
+            else:
+                content += f"| 差异原因 | API返回总数少于实际获取数量，可能是API统计存在问题 |\n"
+                
+            if "error_message" in sync_result and sync_result.get("error_message"):
+                content += f"\n> **同步已被跳过**: {sync_result.get('error_message')}\n\n"
+            
         content += f"| 新增资产 | {created} 个 |\n"
         content += f"| 更新资产 | {updated} 个 |\n"
         content += f"| 删除资产 | {deleted} 个 |\n"
@@ -236,51 +265,97 @@ class DingTalkNotifier:
             content += "### **新增资产详情**\n\n"
             
             # 使用表格展示资产信息
-            content += "| 主机名 | IP地址 | 平台类型 |\n"
-            content += "|---|---|---|\n"
+            content += "| 主机名 | IP地址 | 平台类型 | 实例ID |\n"
+            content += "|---|---|---|---|\n"
             
             # 限制显示的资产数量
             limit = min(len(created_assets), 10)
             for i in range(limit):
                 asset = created_assets[i]
-                # 尝试多种可能的主机名字段
-                hostname = "Unknown"
-                for name_key in ['hostname', 'instance_name', 'name']:
-                    if asset.get(name_key):
-                        hostname = asset.get(name_key)
-                        break
-                        
-                ip = asset.get('ip', 'No IP')
+                # 获取资产名称
+                asset_name = "Unknown"
+                if hasattr(asset, 'name') and asset.name:
+                    asset_name = asset.name
+                elif isinstance(asset, dict):
+                    for name_key in ['hostname', 'instance_name', 'name']:
+                        if asset.get(name_key):
+                            asset_name = asset.get(name_key)
+                            break
+                
+                # 获取IP地址
+                asset_ip = "No IP"
+                if hasattr(asset, 'address') and asset.address:
+                    asset_ip = asset.address
+                elif hasattr(asset, 'ip') and asset.ip:
+                    asset_ip = asset.ip
+                elif isinstance(asset, dict):
+                    asset_ip = asset.get("ip", asset.get("address", "No IP"))
                 
                 # 获取操作系统类型
                 os_type = "Unknown"
-                for os_key in ['os', 'os_type', 'platform', 'system_type', 'system']:
-                    if asset.get(os_key):
-                        os_value = asset.get(os_key, '').lower()
-                        if 'linux' in os_value or 'centos' in os_value or 'ubuntu' in os_value or 'debian' in os_value:
-                            os_type = "Linux"
-                            break
-                        elif 'windows' in os_value or 'win' in os_value:
-                            os_type = "Windows"
-                            break
-                        else:
-                            os_type = asset.get(os_key)
-                            break
+                if hasattr(asset, 'platform'):
+                    os_value = getattr(asset, 'platform', '').lower()
+                    if 'linux' in os_value or 'centos' in os_value or 'ubuntu' in os_value or 'debian' in os_value:
+                        os_type = "Linux"
+                    elif 'windows' in os_value or 'win' in os_value:
+                        os_type = "Windows"
+                    else:
+                        os_type = getattr(asset, 'platform', "Unknown")
+                elif isinstance(asset, dict):
+                    for os_key in ['os', 'os_type', 'platform', 'system_type', 'system']:
+                        if asset.get(os_key):
+                            os_value = asset.get(os_key, '').lower()
+                            if 'linux' in os_value or 'centos' in os_value or 'ubuntu' in os_value or 'debian' in os_value:
+                                os_type = "Linux"
+                                break
+                            elif 'windows' in os_value or 'win' in os_value:
+                                os_type = "Windows"
+                                break
+                            else:
+                                os_type = asset.get(os_key)
+                                break
                 
-                # 使用圆点符号表示列表项，与截图一致，添加平台类型列
-                content += f"| {hostname} | {ip} | {os_type} |\n"
+                # 提取实例ID
+                instance_id = "Unknown"
+                if isinstance(asset, dict):
+                    instance_id = asset.get("instance_id", "Unknown")
+                
+                # 添加行
+                content += f"| {asset_name} | {asset_ip} | {os_type} | {instance_id} |\n"
             
             # 添加查看详情链接
             if len(created_assets) > limit:
                 content += f"\n*等共 {len(created_assets)} 个资产*\n"
+        
+        # 添加更新资产详情
+        if 'update_reasons' in sync_result and sync_result.get('update_reasons') and updated > 0:
+            content += "\n### **更新资产详情**\n\n"
+            
+            # 使用表格展示资产信息
+            content += "| 主机名 | 实例ID | 更新原因 |\n"
+            content += "|---|---|---|\n"
+            
+            # 限制显示的资产数量
+            update_reasons = sync_result.get('update_reasons', [])
+            limit = min(len(update_reasons), 10)
+            for i in range(limit):
+                update = update_reasons[i]
+                asset_name = update.get('asset', 'Unknown')
+                instance_id = update.get('instance_id', 'Unknown')
+                reasons = ", ".join(update.get('reasons', ['Unknown']))
+                
+                content += f"| {asset_name} | {instance_id} | {reasons} |\n"
+            
+            if len(update_reasons) > limit:
+                content += f"\n*等共 {len(update_reasons)} 个更新资产*\n"
         
         # 添加删除资产详情
         if deleted_assets and deleted > 0:
             content += "\n### **删除资产详情**\n\n"
             
             # 使用表格展示资产信息
-            content += "| 主机名 | IP地址 | 平台类型 |\n"
-            content += "|---|---|---|\n"
+            content += "| 主机名 | IP地址 | 平台类型 | 删除原因 |\n"
+            content += "|---|---|---|---|\n"
             
             # 限制显示的资产数量
             limit = min(len(deleted_assets), 10)
@@ -298,14 +373,24 @@ class DingTalkNotifier:
                 
                 # 获取IP地址
                 asset_ip = "No IP"
-                if hasattr(asset, 'ip') and asset.ip:
+                if hasattr(asset, 'address') and asset.address:
+                    asset_ip = asset.address
+                elif hasattr(asset, 'ip') and asset.ip:
                     asset_ip = asset.ip
                 elif isinstance(asset, dict):
-                    asset_ip = asset.get("ip", "No IP")
+                    asset_ip = asset.get("ip", asset.get("address", "No IP"))
                 
                 # 获取操作系统类型
                 os_type = "Unknown"
-                if isinstance(asset, dict):
+                if hasattr(asset, 'platform'):
+                    os_value = getattr(asset, 'platform', '').lower()
+                    if 'linux' in os_value or 'centos' in os_value or 'ubuntu' in os_value or 'debian' in os_value:
+                        os_type = "Linux"
+                    elif 'windows' in os_value or 'win' in os_value:
+                        os_type = "Windows"
+                    else:
+                        os_type = getattr(asset, 'platform', "Unknown")
+                elif isinstance(asset, dict):
                     for os_key in ['os', 'os_type', 'platform', 'system_type', 'system']:
                         if asset.get(os_key):
                             os_value = asset.get(os_key, '').lower()
@@ -319,8 +404,13 @@ class DingTalkNotifier:
                                 os_type = asset.get(os_key)
                                 break
                 
+                # 获取删除原因
+                delete_reason = "云平台中不存在"
+                if isinstance(asset, dict) and asset.get("reason"):
+                    delete_reason = asset.get("reason")
+                
                 # 添加平台类型列
-                content += f"| {asset_name} | {asset_ip} | {os_type} |\n"
+                content += f"| {asset_name} | {asset_ip} | {os_type} | {delete_reason} |\n"
             
             if len(deleted_assets) > limit:
                 content += f"\n*等共 {len(deleted_assets)} 个资产*\n"
@@ -330,17 +420,31 @@ class DingTalkNotifier:
             content += "\n### **错误详情**\n\n"
             
             # 使用表格展示错误信息
-            content += "| 资产 | 错误信息 |\n"
-            content += "|---|---|\n"
+            content += "| 操作 | 资产 | 错误信息 |\n"
+            content += "|---|---|---|\n"
             
             # 限制显示的错误数量
             errors = sync_result.get("errors", [])
-            limit = min(len(errors), 5)
+            limit = min(len(errors), 10)
             for i in range(limit):
                 error = errors[i]
-                asset_ip = error.get('asset_ip', 'Unknown')
+                operation = error.get('operation', 'Unknown').upper()
+                
+                # 获取资产名称或IP
+                if 'asset_name' in error:
+                    asset_name = error.get('asset_name')
+                elif 'asset_ip' in error:
+                    asset_name = error.get('asset_ip')
+                elif 'instance_id' in error:
+                    asset_name = f"实例ID: {error.get('instance_id')}"
+                else:
+                    asset_name = "未知资产"
+                
+                # 获取错误消息
                 error_msg = error.get('message', 'Unknown error')
-                content += f"| {asset_ip} | {error_msg} |\n"
+                
+                # 添加错误信息行
+                content += f"| {operation} | {asset_name} | {error_msg} |\n"
             
             if len(errors) > limit:
                 content += f"\n*等共 {len(errors)} 个错误*\n"
@@ -421,7 +525,7 @@ class NotificationManager:
             else:
                 logger.warning("钉钉webhook未配置，无法初始化钉钉通知器")
     
-    def notify_asset_changes(self, sync_result: Dict[str, Any], platform: str, cloud_name: str, created_assets: List[Dict[str, Any]] = None, deleted_assets: List[Dict[str, Any]] = None) -> bool:
+    def notify_asset_changes(self, sync_result: Dict[str, Any], platform: str, cloud_name: str, created_assets: List[Dict[str, Any]] = None, deleted_assets: List[Dict[str, Any]] = None, is_failure: bool = False) -> bool:
         """
         发送资产变更通知
         
@@ -431,29 +535,53 @@ class NotificationManager:
             cloud_name: 云平台名称
             created_assets: 新创建的资产列表
             deleted_assets: 已删除的资产列表
+            is_failure: 是否为失败通知，为True时即使没有变更也发送通知
             
         Returns:
             bool: 是否有通知成功发送
         """
-        # 检查是否有变更，如果没有变更则不发送通知
-        if (sync_result.get("created", 0) == 0 and 
-            sync_result.get("updated", 0) == 0 and 
-            sync_result.get("deleted", 0) == 0):
-            logger.info("没有资产变更，不发送通知")
-            return True
+        # 如果是失败通知或存在错误信息，即使没有变更也发送通知
+        if not is_failure and not sync_result.get('error_message'):
+            # 检查是否有变更，如果没有变更则不发送通知
+            if (sync_result.get("created", 0) == 0 and 
+                sync_result.get("updated", 0) == 0 and 
+                sync_result.get("deleted", 0) == 0 and
+                sync_result.get("failed", 0) == 0):
+                logger.info("没有资产变更，不发送通知")
+                return True
             
         success = False
         
-        # 发送钉钉通知
-        dingtalk = self.notifiers.get('dingtalk')
-        if dingtalk:
-            dingtalk_success = dingtalk.send_asset_changes(
-                sync_result=sync_result,
-                platform=platform,
-                cloud_name=cloud_name,
-                created_assets=created_assets,
-                deleted_assets=deleted_assets
-            )
-            success = success or dingtalk_success
-            
+        try:
+            # 发送钉钉通知
+            dingtalk = self.notifiers.get('dingtalk')
+            if dingtalk:
+                # 确保created_assets和deleted_assets是列表
+                if created_assets is None:
+                    created_assets = []
+                if deleted_assets is None:
+                    deleted_assets = []
+                
+                # 处理更新原因和失败原因
+                if "update_reasons" not in sync_result and "updated" in sync_result and sync_result.get("updated", 0) > 0:
+                    logger.warning("同步结果中缺少update_reasons字段")
+                    sync_result["update_reasons"] = []
+                
+                if "errors" not in sync_result and "failed" in sync_result and sync_result.get("failed", 0) > 0:
+                    logger.warning("同步结果中缺少errors字段")
+                    sync_result["errors"] = [{"message": "未知错误"}]
+                
+                dingtalk_success = dingtalk.send_asset_changes(
+                    sync_result=sync_result,
+                    platform=platform,
+                    cloud_name=cloud_name,
+                    created_assets=created_assets,
+                    deleted_assets=deleted_assets
+                )
+                success = success or dingtalk_success
+                logger.info(f"钉钉通知发送{'成功' if dingtalk_success else '失败'}")
+        except Exception as e:
+            logger.error(f"发送通知时发生错误: {str(e)}", exc_info=True)
+            success = False
+                
         return success 

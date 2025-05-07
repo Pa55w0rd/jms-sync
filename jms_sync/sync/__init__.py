@@ -11,8 +11,10 @@
 - 创建/更新资产节点结构
 """
 
+from jms_sync.sync.asset_sync import AssetSyncManager
 from jms_sync.sync.sync_manager import SyncManager
-from jms_sync.sync.operations import CloudAssetOperation, AssetSynchronizer
-from jms_sync.jumpserver.models import SyncResult
 
-__all__ = ['SyncManager', 'SyncResult', 'CloudAssetOperation', 'AssetSynchronizer'] 
+__all__ = [
+    'AssetSyncManager',
+    'SyncManager'
+] 

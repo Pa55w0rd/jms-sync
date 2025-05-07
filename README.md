@@ -17,33 +17,39 @@ JMS-Sync 通过云平台 API 获取云服务器实例信息，并将其同步到
   - 多线程并行处理，提高同步速度
   - 批量处理资产，避免内存溢出问题
   - 智能缓存机制，减少重复 API 调用
+  - 增量同步，只处理变更的资产
 
 - **完善的错误处理**
   - 分类错误处理机制，针对不同错误类型采取不同策略
   - 智能重试机制，自动重试临时性错误
   - 详细的错误日志记录，便于问题排查
+  - 同步失败自动恢复机制
 
 - **灵活的配置选项**
   - 支持配置同步参数，如并行线程数、批处理大小等
   - 支持 IP 白名单和受保护 IP 功能
   - 可配置是否执行删除操作
+  - 支持多环境配置
 
 - **完善的日志系统**
   - 结构化日志输出，便于分析
   - 日志轮转机制，避免日志文件过大
   - 可配置的日志级别和格式
+  - 支持JSON格式日志输出
 
 - **通知提醒功能**
   - 支持钉钉机器人通知
   - 资产变更时自动发送通知
   - 详细展示新增、更新和删除的资产信息
   - 灵活的通知配置，支持@指定人员
+  - 美观的Markdown格式通知卡片
 
 ## 系统要求
 
 - Python 3.8 以上（推荐使用 Python 3.8.10）
-- JumpServer 社区版 v4.7.0
+- JumpServer 社区版 v4.7.0 及以上
 - 云平台 API 访问权限和凭证
+- 网络环境可访问JumpServer和云平台API
 
 ## 安装指南
 
@@ -58,6 +64,12 @@ cd jms-sync
 
 ```bash
 pip install -r requirements.txt
+```
+
+对于国内用户，建议使用镜像源加速安装：
+
+```bash
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
 ### 3. 配置文件准备
@@ -96,24 +108,32 @@ cp config.yaml.example config.yaml
    - 账号：填写网关服务器账号
 4. 点击 "提交" 完成网关创建
 
-#### 4.3 创建账号模板
+#### ~~4.3 创建账号模板~~
 
-账号模板用于自动为同步的资产创建登录凭证：
+~~账号模板用于自动为同步的资产创建登录凭证：~~
 
-1. 导航至 "账号管理" > "账号模板"
-2. 点击 "创建" 按钮
-3. 填写凭证信息：
-   - 名称：为模板命名（如 "Linux服务器模板"、"Windows服务器模板"）
-   - 类型：选择 "SSH私钥" (Linux) 或 "密码" (Windows)
-   - 登录用户名：填写默认登录用户（如Linux的 "root"，Windows的 "Administrator"）
-   - 密码或私钥：填写对应的认证信息
-   - 自动推送：建议启用
-4. 点击 "提交" 创建账号模板
-5. 记录创建的账号模板 ID，填入配置文件对应区域
+1. ~~导航至 "账号管理" > "账号模板"~~
+2. ~~点击 "创建" 按钮~~
+3. ~~填写凭证信息~~：
+   - ~~名称：为模板命名（如 "Linux服务器模板"、"Windows服务器模板"）~~
+   - ~~类型：选择 "SSH私钥" (Linux) 或 "密码" (Windows)~~
+   - ~~登录用户名：填写默认登录用户（如Linux的 "root"，Windows的 "Administrator"）~~
+   - ~~密码或私钥：填写对应的认证信息~~
+   - ~~自动推送：建议启用~~
+4. ~~点击 "提交" 创建账号模板~~
+5. ~~记录创建的账号模板 ID，填入配置文件对应区域~~
 
 ## 配置说明
 
 `config.yaml` 包含以下主要配置部分：
+
+### 环境配置
+
+```yaml
+environment:
+  # 环境类型: PRODUCTION, DEVELOPMENT, TESTING
+  type: "DEVELOPMENT"
+```
 
 ### JumpServer 配置
 
@@ -124,10 +144,6 @@ jumpserver:
   access_key_secret: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # 访问密钥
   org_id: "00000000-0000-0000-0000-000000000002"  # 组织ID
   verify_ssl: true  # 是否验证SSL证书
-  # 账号模板配置 - 必须提前在JumpServer中创建
-  account_templates:
-    linux: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # Linux系统账号模板ID
-    windows: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # Windows系统账号模板ID
 ```
 
 > **重要提示**：填写的账号模板ID必须对应JumpServer中已创建的模板，否则资产同步后将无法自动设置登录凭证。
@@ -152,9 +168,6 @@ clouds:
 
 ```yaml
 sync:
-  parallel_workers: 5  # 并行工作线程数
-  batch_size: 50  # 批处理大小
-  cache_ttl: 3600  # 缓存过期时间（秒）
   whitelist: []  # IP白名单，空列表表示不限制
   protected_ips: []  # 保护的IP列表，不会被删除
   no_delete: false  # 是否禁用删除功能
@@ -180,9 +193,12 @@ notification:
 ```yaml
 log:
   level: "INFO"  # 日志级别: DEBUG, INFO, WARNING, ERROR, CRITICAL
-  file: "jms-sync.log"  # 日志文件路径
+  file: "logs/jms-sync.log"  # 日志文件路径
   max_size: 10  # 日志文件最大大小（MB）
   backup_count: 5  # 保留的日志文件数量
+  json_format: false  # 是否使用JSON格式输出日志
+  detailed: false  # 是否使用详细日志格式（包含线程信息）
+  separate_error_log: true  # 是否将ERROR及以上级别的日志单独记录到一个文件
 ```
 
 ## 使用方法
@@ -195,6 +211,29 @@ python jms-sync.py
 
 这将使用默认配置文件（`config.yaml`）运行同步任务。
 
+### 命令行参数
+
+```bash
+python jms-sync.py -c custom-config.yaml  # 使用自定义配置文件
+python jms-sync.py -l DEBUG               # 设置日志级别
+python jms-sync.py --no-log-file          # 不将日志写入文件
+python jms-sync.py -r 5                   # 设置重试次数为5
+python jms-sync.py -i 10                  # 设置重试间隔为10秒
+python jms-sync.py -o results.json        # 将结果输出到JSON文件
+```
+
+完整的命令行参数说明：
+
+| 参数 | 描述 |
+|-----|-----|
+| `-c, --config` | 配置文件路径 (默认: config.yaml) |
+| `-l, --log-level` | 日志级别: DEBUG, INFO, WARNING, ERROR, CRITICAL |
+| `--log-file` | 日志文件路径 |
+| `--no-log-file` | 不输出日志到文件 |
+| `-r, --retries` | 同步失败时的最大重试次数 (默认: 3) |
+| `-i, --interval` | 重试间隔时间(秒) (默认: 5) |
+| `-o, --output` | 将同步结果输出到指定的JSON文件 |
+
 ## 架构说明
 
 JMS-Sync 采用模块化设计，主要包含以下组件：
@@ -206,6 +245,16 @@ JMS-Sync 采用模块化设计，主要包含以下组件：
 - **同步模块**: 协调各模块工作，实现资产同步逻辑
 - **工具模块**: 提供缓存、日志、异常处理等通用功能
 - **通知模块**: 实现资产变更通知功能
+
+### 数据流程
+
+1. 从配置文件加载配置参数
+2. 初始化日志系统和云平台客户端
+3. 调用云平台API获取服务器实例信息
+4. 处理并标准化云平台数据
+5. 创建或获取JumpServer节点
+6. 将处理后的数据同步到JumpServer
+7. 发送通知并记录同步结果
 
 ## 通知功能说明
 
@@ -280,60 +329,137 @@ JMS-Sync 采用模块化设计，主要包含以下组件：
 - **Windows**：自动检测包含"windows"或"win"关键词的资产
 - **其他**：如果无法识别，则显示原始值或"Unknown"
 
+## 性能优化技术
 
-这种智能识别机制使运维人员能够快速了解资产的操作系统类型，无需额外查询。
+JMS-Sync 采用了多种性能优化技术，确保在处理大量资产时保持高效：
+
+### 1. 批量处理
+
+- 将资产分批同步到JumpServer，避免一次处理过多数据导致的内存溢出
+- 默认批量大小为100，可通过配置文件调整
+- 自动根据系统资源调整批处理参数
+
+### 2. 增量同步
+
+- 只处理发生变化的资产，减少API调用和数据传输
+- 使用资产指纹技术快速识别变更
+- 自动跳过未变更的资产，显著提高同步速度
+
+### 3. 缓存机制
+
+- 缓存云平台和JumpServer的数据，减少重复API调用
+- 智能缓存过期策略，确保数据一致性
+- 多级缓存架构，优化读写性能
+
+### 4. 并行处理
+
+- 多线程并行获取云平台资产数据
+- 智能线程池管理，根据系统负载动态调整线程数
+- 区域级并行处理，加速多区域资产同步
+
+### 5. 错误恢复机制
+
+- 细粒度错误追踪，单个资产同步失败不影响整体同步
+- 自动重试临时性错误
+- 记录详细错误信息，便于问题排查
 
 ## 最佳实践
 
 ### 性能优化建议
 
-- 调整 `parallel_workers` 和 `batch_size` 参数以适应您的环境
-- 对于大型环境，建议增加 `cache_ttl` 减少 API 调用
-- 首次运行时建议开启 `--verbose` 参数查看详细日志
+- 在大型环境中，建议启用JSON格式日志，便于日志分析和问题排查
+- 对于网络不稳定环境，适当增加重试次数和间隔时间
+- 使用受保护IP功能，确保关键资产不会被误删
+- 首次运行时开启DEBUG日志级别，后续可调整为INFO级别
+- 定期清理日志文件，避免占用过多磁盘空间
 
 ### 安全建议
 
 - 使用最小权限原则配置云平台和 JumpServer 的 API 凭证
-- 定期轮换 API 密钥
-- 使用 HTTPS 协议访问 JumpServer
-- 谨慎配置钉钉通知，确保不会泄露敏感信息
+- 定期轮换 API 密钥，建议至少每90天更新一次
+- 使用 HTTPS 协议访问 JumpServer，确保通信加密
+- 谨慎配置钉钉通知，避免泄露敏感信息
+- 保护好配置文件，避免明文凭证泄露
 
 ## 故障排除
 
 ### 常见问题
 
 1. **连接超时**
-   - 检查网络连接
+   - 检查网络连接和防火墙设置
    - 确认 JumpServer 和云平台 API 地址正确
    - 适当增加重试次数和超时时间
+   - 检查代理配置是否正确
 
 2. **认证失败**
-   - 检查 API 密钥是否正确
+   - 检查 API 密钥是否正确，注意不要有多余的空格
    - 确认密钥是否有效且未过期
-   - 验证 API 权限设置
+   - 验证 API 权限设置是否足够
+   - 检查系统时间是否准确（某些API认证依赖时间戳）
 
 3. **同步失败**
    - 查看日志文件了解详细错误信息
-   - 检查配置文件格式是否正确
+   - 检查配置文件格式是否正确，确保无语法错误
    - 适当减小批处理大小减轻负载
+   - 验证JumpServer和云平台API是否正常运行
 
 4. **通知发送失败**
    - 检查钉钉机器人配置是否正确
    - 确认 Webhook 地址有效且可访问
    - 检查网络环境是否允许访问钉钉服务器
+   - 验证签名密钥是否正确
+
+### 日志分析
+
+查看日志文件定位问题：
+```bash
+tail -f logs/jms-sync.log
+```
+
+查看错误日志：
+```bash
+tail -f logs/jms-sync.error.log
+```
 
 ## 开发指南
 
 ### 添加新云平台支持
 
 1. 在 `jms_sync/cloud` 目录下创建新的云平台模块
-2. 继承 `CloudBase` 类并实现必要的方法
+2. 继承 `CloudBase` 类并实现必要的方法：
+   ```python
+   from jms_sync.cloud.base import CloudBase
+   
+   class NewCloudProvider(CloudBase):
+       def __init__(self, access_key_id, access_key_secret, region):
+           super().__init__(access_key_id, access_key_secret, region)
+           
+       def get_instances(self):
+           # 实现获取云平台实例的逻辑
+           pass
+           
+       def set_region(self, region):
+           # 实现切换区域的逻辑
+           pass
+   ```
 3. 在 `jms_sync/cloud/__init__.py` 中注册新的云平台
+4. 在 `CloudClientFactory` 中添加创建新云平台客户端的逻辑
 
 ### 扩展通知方式
 
-1. 在 `jms_sync/utils/notifier.py` 中创建新的通知类
+1. 在 `jms_sync/utils/notifier.py` 中创建新的通知类：
+   ```python
+   class NewNotifier:
+       def __init__(self, config):
+           self.config = config
+           # 初始化逻辑
+           
+       def send_notification(self, title, content):
+           # 实现发送通知的逻辑
+           pass
+   ```
 2. 在 `NotificationManager` 类中添加对应的初始化和发送方法
+3. 在配置文件中添加新通知方式的配置项
 
 ### 代码规范
 
@@ -341,6 +467,7 @@ JMS-Sync 采用模块化设计，主要包含以下组件：
 - 使用类型提示增强代码可读性
 - 编写详细的函数和类文档
 - 使用 pylint 或 flake8 进行代码检查
+- 保持代码覆盖率在80%以上
 
 ## 贡献
 
@@ -389,3 +516,11 @@ JMS-Sync 采用模块化设计，主要包含以下组件：
 - JMS-Sync应部署在能够同时访问JumpServer和云平台API的网络环境
 - 建议通过HTTPS连接JumpServer，确保API通信加密
 - 如使用HTTP连接，务必确保在受信任的内网环境中运行
+
+## 未来规划
+
+- 支持更多云平台（腾讯云、AWS、Azure等）
+- 增加Web管理界面，实现可视化配置和监控
+- 支持更多通知方式（邮件、企业微信等）
+- 实现资产变更自动审批流程
+- 集成自动化运维功能

@@ -20,6 +20,25 @@ logger = logging.getLogger(__name__)
 _CACHE: Dict[str, Tuple[Any, datetime]] = {}
 
 
+def deprecated(reason: str):
+    """
+    标记函数或方法为已弃用。
+
+    Args:
+        reason: 弃用原因
+
+    Returns:
+        Callable: 装饰器函数
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            logger.warning(f"调用已弃用的函数 {func.__name__}: {reason}")
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
 def _generate_cache_key(func: Callable, args: Tuple, kwargs: Dict) -> str:
     """
     生成缓存键。
@@ -174,12 +193,16 @@ def retry(
     return decorator
 
 
-def log_execution_time(level: str = 'INFO'):
+def log_function(level: str = 'INFO', log_args: bool = True, log_result: bool = False, log_time: bool = True, time_format: str = ':.2f'):
     """
-    记录函数执行时间的装饰器。
+    增强版日志记录装饰器，整合了执行时间记录和参数记录功能。
 
     Args:
         level: 日志级别
+        log_args: 是否记录函数参数
+        log_result: 是否记录函数返回值
+        log_time: 是否记录执行时间
+        time_format: 时间格式化字符串
 
     Returns:
         Callable: 装饰器函数
@@ -192,19 +215,60 @@ def log_execution_time(level: str = 'INFO'):
         @functools.wraps(func)
         def wrapper(*args, **kwargs) -> Any:
             """包装函数"""
+            # 记录函数调用
+            if log_args:
+                args_str = ", ".join([str(arg) for arg in args])
+                kwargs_str = ", ".join([f"{k}={v}" for k, v in kwargs.items()])
+                params = f"{args_str}{', ' if args_str and kwargs_str else ''}{kwargs_str}"
+                getattr(logger, level.lower())(f"调用函数 {func.__name__}({params})")
+            else:
+                getattr(logger, level.lower())(f"调用函数 {func.__name__}")
+            
+            # 记录执行时间
             start_time = time.time()
-            result = func(*args, **kwargs)
-            end_time = time.time()
-            
-            execution_time = end_time - start_time
-            log_func = getattr(logger, level.lower())
-            log_func(f"函数 {func.__name__} 执行时间: {execution_time:.2f}秒")
-            
-            return result
+            try:
+                result = func(*args, **kwargs)
+                end_time = time.time()
+                
+                # 记录函数返回值
+                if log_result:
+                    getattr(logger, level.lower())(f"函数 {func.__name__} 返回值: {result}")
+                
+                # 记录执行时间
+                if log_time:
+                    execution_time = end_time - start_time
+                    getattr(logger, level.lower())(f"函数 {func.__name__} 执行时间: {execution_time:{time_format}}秒")
+                
+                return result
+            except Exception as e:
+                if log_time:
+                    end_time = time.time()
+                    execution_time = end_time - start_time
+                    logger.exception(f"函数 {func.__name__} 执行异常: {str(e)}, 执行时间: {execution_time:{time_format}}秒")
+                else:
+                    logger.exception(f"函数 {func.__name__} 执行异常: {str(e)}")
+                raise
         
         return wrapper
     
     return decorator
+
+
+@deprecated("请使用功能更强大的log_function装饰器代替")
+def log_execution_time(level: str = 'INFO'):
+    """
+    记录函数执行时间的装饰器(已弃用)。
+    
+    请使用功能更强大的log_function装饰器代替，例如:
+    @log_function(level='INFO', log_args=False, log_time=True)
+
+    Args:
+        level: 日志级别
+
+    Returns:
+        Callable: 装饰器函数
+    """
+    return log_function(level=level, log_args=False, log_result=False, log_time=True)
 
 
 def validate_params(**param_validators):
@@ -262,23 +326,4 @@ def singleton(cls):
             instances[cls] = cls(*args, **kwargs)
         return instances[cls]
     
-    return get_instance
-
-
-def deprecated(reason: str):
-    """
-    标记函数或方法为已弃用。
-
-    Args:
-        reason: 弃用原因
-
-    Returns:
-        Callable: 装饰器函数
-    """
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            logger.warning(f"调用已弃用的函数 {func.__name__}: {reason}")
-            return func(*args, **kwargs)
-        return wrapper
-    return decorator 
+    return get_instance 

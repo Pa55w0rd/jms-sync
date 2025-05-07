@@ -1,16 +1,17 @@
 # JMS-Sync 配置文件
 
+# 环境配置
+environment:
+  # 环境类型: PRODUCTION, DEVELOPMENT, TESTING
+  type: "DEVELOPMENT"
+
 # JumpServer 配置
 jumpserver:
-  url: "http://jumpserver.example.com"  # JumpServer URL
+  url: "https://jumpserver.example.com"  # JumpServer URL
   access_key_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # 访问密钥ID
   access_key_secret: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # 访问密钥
   org_id: "00000000-0000-0000-0000-000000000002"  # 组织ID
   verify_ssl: true  # 是否验证SSL证书
-  # 账号模板配置
-  account_templates:
-    linux: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # Linux系统账号模板ID
-    windows: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # Windows系统账号模板ID
 
 # 云平台配置
 clouds:
@@ -36,12 +37,7 @@ clouds:
     enabled: true
 
 # 同步配置
-sync:
-  # 性能调优
-  parallel_workers: 5  # 并行工作线程数
-  batch_size: 50  # 批处理大小
-  cache_ttl: 3600  # 缓存过期时间（秒）
-  
+sync: 
   # 资产管理选项
   whitelist: []  # IP白名单，空列表表示不限制
   protected_ips: []  # 保护的IP列表，不会被删除
@@ -55,14 +51,16 @@ notification:
     webhook: "https://oapi.dingtalk.com/robot/send?access_token=xxxxxxxx"  # 钉钉机器人webhook
     secret: "SECxxxxxxxxxxxxxxxx"  # 钉钉机器人签名密钥，如果没有可以留空
     at_mobiles:  # 需要@的手机号列表
-      - "13800138000"
-      - "13900139000"
+      - "138xxxxxxxx"
+      - "139xxxxxxxx"
     at_all: false  # 是否@所有人
 
 # 日志配置
 log:
   level: "INFO"  # 日志级别: DEBUG, INFO, WARNING, ERROR, CRITICAL
-  file: "jms-sync.log"  # 日志文件路径
+  file: "logs/jms-sync.log"  # 日志文件路径
   max_size: 10  # 日志文件最大大小（MB）
   backup_count: 5  # 保留的日志文件数量
-  format: "%(asctime)s [%(levelname)s] [%(name)s:%(lineno)d] - %(message)s"  # 日志格式
+  json_format: false  # 是否使用JSON格式输出日志
+  detailed: false  # 是否使用详细日志格式（包含线程信息）
+  separate_error_log: true  # 是否将ERROR及以上级别的日志单独记录到一个文件

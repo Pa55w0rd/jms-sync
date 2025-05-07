@@ -23,6 +23,8 @@ ENV/
 .idea/
 .vscode/
 .cursorrules
+.cursor/
+notes
 tests/
 
 # 构建和分发

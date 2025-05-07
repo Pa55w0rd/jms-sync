@@ -50,24 +50,6 @@ class ConfigValidator:
             if not isinstance(sync_config, dict):
                 raise ConfigError("sync配置应为字典类型")
             
-            # 验证parallel_workers
-            parallel_workers = sync_config.get('parallel_workers')
-            if parallel_workers is not None:
-                if not isinstance(parallel_workers, int) or parallel_workers <= 0:
-                    raise ConfigError("parallel_workers应为正整数")
-            
-            # 验证batch_size
-            batch_size = sync_config.get('batch_size')
-            if batch_size is not None:
-                if not isinstance(batch_size, int) or batch_size <= 0:
-                    raise ConfigError("batch_size应为正整数")
-            
-            # 验证cache_ttl
-            cache_ttl = sync_config.get('cache_ttl')
-            if cache_ttl is not None:
-                if not isinstance(cache_ttl, int) or cache_ttl <= 0:
-                    raise ConfigError("cache_ttl应为正整数")
-            
             # 验证whitelist
             whitelist = sync_config.get('whitelist')
             if whitelist is not None and not isinstance(whitelist, list):

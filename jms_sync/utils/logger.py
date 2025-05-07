@@ -11,6 +11,7 @@
 - 支持按不同级别记录到不同文件
 - 提供日志装饰器用于记录函数调用
 - 支持JSON格式化的日志输出
+- 配置文件管理的日志级别控制
 """
 
 import os
@@ -48,6 +49,74 @@ LOG_LEVEL_MAP = {
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # 10MB
 DEFAULT_BACKUP_COUNT = 5
 
+# 全局配置对象
+_config = None
+
+
+def set_global_config(config):
+    """
+    设置全局配置对象
+    
+    Args:
+        config: 配置对象
+    """
+    global _config
+    _config = config
+
+
+def get_global_config():
+    """
+    获取全局配置对象
+    
+    Returns:
+        配置对象或None
+    """
+    return _config
+
+
+# 配置文件环境配置
+def is_production() -> bool:
+    """
+    判断当前是否为生产环境
+    
+    Returns:
+        bool: 是否为生产环境
+    """
+    config = get_global_config()
+    if config:
+        # 尝试从配置文件获取环境配置
+        env = config.get('environment', {}).get('type', '').upper()
+        return env == 'PRODUCTION'
+    else:
+        # 兼容模式：如果没有配置对象，则从环境变量获取
+        return False
+
+
+def get_environment_log_level() -> str:
+    """
+    根据环境获取默认日志级别
+    
+    Returns:
+        str: 默认日志级别
+    """
+    config = get_global_config()
+    if config:
+        # 先从配置文件获取日志级别
+        log_config = config.get('log', {})
+        env_level = log_config.get('level', '').upper()
+        if env_level in LOG_LEVEL_MAP:
+            return env_level
+        
+        # 如果没有设置或无效，则根据环境类型设置默认级别
+        if is_production():
+            return 'INFO'
+        else:
+            return 'DEBUG'
+    else:
+        # 兼容模式：如果没有配置对象，则使用默认值
+        return 'INFO'
+
+
 # 上下文跟踪
 class LogContext:
     """日志上下文，用于跟踪请求或任务"""
@@ -80,6 +149,7 @@ class LogContext:
         """清除当前线程的上下文"""
         if hasattr(cls._local, 'context'):
             del cls._local.context
+
 
 # 结构化日志格式化器
 class StructuredLogFormatter(logging.Formatter):
@@ -130,20 +200,27 @@ class StructuredLogFormatter(logging.Formatter):
         
         # 如果有额外数据，附加到日志
         if extras:
-            json_extras = json.dumps(extras, ensure_ascii=False, default=str)
-            return f"{msg} {json_extras}"
+            try:
+                json_extras = json.dumps(extras, ensure_ascii=False, default=str)
+                return f"{msg} {json_extras}"
+            except Exception:
+                # 如果JSON序列化失败，仅添加trace_id
+                trace_id = LogContext.get_context_value('trace_id', 'N/A')
+                return f"{msg} [trace_id={trace_id}]"
         
         return msg
 
+
 def setup_logger(
-    log_level: str = 'INFO',
+    log_level: Optional[str] = None,
     log_file: Optional[str] = None,
     log_format: str = DEFAULT_LOG_FORMAT,
     max_bytes: int = DEFAULT_MAX_BYTES,
     backup_count: int = DEFAULT_BACKUP_COUNT,
     detailed: bool = False,
     json_format: bool = False,
-    separate_error_log: bool = False
+    separate_error_log: bool = False,
+    env_aware: bool = True
 ) -> logging.Logger:
     """
     设置日志记录器。
@@ -157,6 +234,7 @@ def setup_logger(
         detailed: 是否使用详细日志格式（包含线程信息）
         json_format: 是否使用JSON格式输出日志
         separate_error_log: 是否将ERROR及以上级别的日志单独记录到一个文件
+        env_aware: 是否根据环境自动调整日志级别
 
     Returns:
         logging.Logger: 日志记录器
@@ -164,8 +242,13 @@ def setup_logger(
     # 获取根日志记录器
     logger = logging.getLogger()
     
-    # 设置日志级别
-    level = LOG_LEVEL_MAP.get(log_level.upper(), logging.INFO)
+    # 设置日志级别 - 环境感知
+    if env_aware:
+        default_level = get_environment_log_level()
+        level = LOG_LEVEL_MAP.get(log_level or default_level, logging.INFO)
+    else:
+        level = LOG_LEVEL_MAP.get(log_level or 'INFO', logging.INFO)
+    
     logger.setLevel(level)
     
     # 清除已有的处理器
@@ -173,7 +256,10 @@ def setup_logger(
         logger.removeHandler(handler)
     
     # 选择日志格式
-    if json_format:
+    if is_production() and not detailed and not json_format:
+        # 生产环境使用简洁格式
+        log_format = '%(asctime)s [%(levelname)s] - %(message)s'
+    elif json_format:
         log_format = JSON_LOG_FORMAT
     elif detailed:
         log_format = DETAILED_LOG_FORMAT
@@ -225,6 +311,13 @@ def setup_logger(
             error_handler.setLevel(logging.ERROR)
             logger.addHandler(error_handler)
     
+    # 特殊处理：减少某些库的日志输出
+    if is_production():
+        # 在生产环境中，调高一些库的日志级别，减少无用日志
+        for lib_logger_name in ['urllib3', 'requests', 'chardet', 'botocore', 'paramiko', 'alibabacloud', 'tea', 'huaweicloud']:
+            lib_logger = logging.getLogger(lib_logger_name)
+            lib_logger.setLevel(logging.WARNING)
+    
     return logger
 
 
@@ -246,75 +339,89 @@ def get_logger(name: str, log_level: Optional[str] = None) -> logging.Logger:
         level = LOG_LEVEL_MAP.get(log_level.upper(), None)
         if level is not None:
             logger.setLevel(level)
+    # 否则根据环境设置默认级别
+    elif not logger.level:
+        env_level = get_environment_log_level()
+        logger.setLevel(LOG_LEVEL_MAP.get(env_level, logging.INFO))
     
     return logger
 
 
 class StructuredLogger:
     """
-    结构化日志记录器，提供额外的上下文信息记录功能。
+    结构化日志记录器，支持添加结构化数据。
     
     使用示例:
     ```python
     logger = StructuredLogger("my_module")
-    logger.info("用户登录", user_id=123, ip="192.168.1.1")
-    logger.error("操作失败", operation="delete", error_code=404)
+    logger.info("操作成功", user_id=123, action="login")
     ```
     """
     
     def __init__(self, name: str):
         """
-        初始化结构化日志记录器。
+        初始化结构化日志记录器
         
         Args:
             name: 日志记录器名称
         """
-        self.logger = logging.getLogger(name)
-        self.context = {}  # 全局上下文
+        self.logger = get_logger(name)
+        self.name = name
+        self.context = {}
     
     def add_context(self, **kwargs) -> None:
         """
-        添加全局上下文信息，这些信息将出现在所有后续的日志记录中。
+        添加上下文数据，这些数据将被添加到所有日志中
         
         Args:
-            **kwargs: 上下文键值对
+            **kwargs: 上下文数据
         """
         self.context.update(kwargs)
     
     def remove_context(self, *keys) -> None:
         """
-        从全局上下文中移除指定的键。
+        移除上下文数据
         
         Args:
-            *keys: 要移除的上下文键
+            *keys: 要移除的键
         """
         for key in keys:
-            self.context.pop(key, None)
+            if key in self.context:
+                del self.context[key]
     
     def clear_context(self) -> None:
-        """清除所有全局上下文信息。"""
+        """清除所有上下文数据"""
         self.context.clear()
     
     def _format_structured_message(self, message: str, **kwargs) -> str:
         """
-        格式化结构化消息。
+        格式化结构化消息
         
         Args:
             message: 日志消息
             **kwargs: 结构化数据
-        
+            
         Returns:
-            str: 格式化后的结构化消息
+            str: 格式化后的消息
         """
-        # 合并全局上下文和当前上下文
-        data = {**self.context, **kwargs}
+        # 合并上下文和当前调用的关键字参数
+        data = {**self.context}
+        
+        # 添加本次调用的数据（可能覆盖上下文中的同名数据）
+        if kwargs:
+            data.update(kwargs)
         
         if not data:
             return message
-            
-        # 格式化为JSON
-        json_part = json.dumps(data, ensure_ascii=False)
-        return f"{message} {json_part}"
+        
+        try:
+            # 尝试将数据转换为JSON字符串
+            json_data = json.dumps(data, ensure_ascii=False, default=str)
+            return f"{message} {json_data}"
+        except Exception:
+            # 如果转换失败，使用简单的字符串表示
+            data_str = " ".join([f"{k}={v}" for k, v in data.items()])
+            return f"{message} [{data_str}]"
     
     def debug(self, message: str, **kwargs) -> None:
         """
@@ -373,16 +480,14 @@ class StructuredLogger:
     
     def exception(self, message: str, exc_info: bool = True, **kwargs) -> None:
         """
-        记录带异常信息的ERROR级别结构化日志。
+        记录异常信息。
         
         Args:
             message: 日志消息
             exc_info: 是否包含异常信息
             **kwargs: 结构化数据
         """
-        if self.logger.isEnabledFor(logging.ERROR):
-            formatted_message = self._format_structured_message(message, **kwargs)
-            self.logger.exception(formatted_message)
+        self.logger.exception(self._format_structured_message(message, **kwargs), exc_info=exc_info)
 
 
 class LoggerMixin:
@@ -414,7 +519,9 @@ class LoggerMixin:
             *args: 位置参数
             **kwargs: 关键字参数
         """
-        self.logger.debug(f"调用方法 {method_name} - 参数: {args}, 关键字参数: {kwargs}")
+        # 在生产环境减少详细日志
+        if not is_production() or self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(f"调用方法 {method_name} - 参数: {args}, 关键字参数: {kwargs}")
     
     def log_execution_time(self, method_name: str, start_time: float, end_time: float) -> None:
         """
@@ -426,12 +533,18 @@ class LoggerMixin:
             end_time: 结束时间
         """
         execution_time = end_time - start_time
-        self.logger.debug(f"方法 {method_name} 执行时间: {execution_time:.4f}秒")
+        # 根据执行时间长短选择日志级别
+        if execution_time > 1.0:  # 执行时间超过1秒，使用INFO级别
+            self.logger.info(f"方法 {method_name} 执行时间: {execution_time:.4f}秒")
+        else:
+            self.logger.debug(f"方法 {method_name} 执行时间: {execution_time:.4f}秒")
 
 
-def log_function(level: str = 'DEBUG', log_args: bool = True, log_result: bool = False) -> Callable[[F], F]:
+def log_function(level: str = 'INFO', log_args: bool = True, log_result: bool = False) -> Callable[[F], F]:
     """
     记录函数调用的装饰器。
+    
+    推荐使用 jms_sync.utils.decorators.log_function 装饰器替代此函数。
     
     Args:
         level: 日志级别
@@ -441,80 +554,86 @@ def log_function(level: str = 'DEBUG', log_args: bool = True, log_result: bool =
     Returns:
         函数装饰器
     """
-    def decorator(func: F) -> F:
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            logger_name = f"{func.__module__}.{func.__qualname__}"
-            logger = get_logger(logger_name)
-            log_method = getattr(logger, level.lower())
-            
-            # 记录函数调用
-            if log_args:
-                args_str = ", ".join([str(arg) for arg in args])
-                kwargs_str = ", ".join([f"{k}={v}" for k, v in kwargs.items()])
-                params = f"{args_str}{', ' if args_str and kwargs_str else ''}{kwargs_str}"
-                log_method(f"调用函数 {func.__name__}({params})")
-            else:
-                log_method(f"调用函数 {func.__name__}")
-            
-            # 记录执行时间
-            start_time = time.time()
-            try:
-                result = func(*args, **kwargs)
-                end_time = time.time()
-                
-                # 记录函数返回值
-                if log_result:
-                    log_method(f"函数 {func.__name__} 返回值: {result}")
-                
-                # 记录执行时间
-                execution_time = end_time - start_time
-                log_method(f"函数 {func.__name__} 执行时间: {execution_time:.4f}秒")
-                
-                return result
-            except Exception as e:
-                end_time = time.time()
-                execution_time = end_time - start_time
-                logger.exception(f"函数 {func.__name__} 执行异常: {str(e)}, 执行时间: {execution_time:.4f}秒")
-                raise
-        
-        return cast(F, wrapper)
-    
-    return decorator
+    from jms_sync.utils.decorators import log_function as decorator_log_function
+    return decorator_log_function(level=level, log_args=log_args, log_result=log_result)
 
 
 def log_dict(logger: logging.Logger, message: str, data: Dict[str, Any], level: str = 'INFO') -> None:
     """
-    记录字典数据，格式化输出。
+    记录字典数据。
 
     Args:
         logger: 日志记录器
         message: 日志消息
-        data: 要记录的字典数据
+        data: 字典数据
         level: 日志级别
     """
-    log_func = getattr(logger, level.lower())
-    log_func(f"{message}:\n{json.dumps(data, indent=2, ensure_ascii=False)}")
+    log_method = getattr(logger, level.lower())
+    try:
+        # 生产环境格式化为一行，便于日志分析
+        if is_production():
+            log_method(f"{message}: {json.dumps(data, ensure_ascii=False)}")
+        else:
+            # 开发环境格式化为多行，便于阅读
+            formatted_json = json.dumps(data, ensure_ascii=False, indent=2)
+            log_method(f"{message}:\n{formatted_json}")
+    except Exception:
+        # 如果JSON序列化失败，使用字符串表示
+        log_method(f"{message}: {str(data)}")
 
 
 def log_exception(logger: logging.Logger, exc: Exception, message: str = "发生异常") -> None:
     """
     记录异常信息。
+    
+    推荐使用 jms_sync.utils.exceptions.handle_exception 函数替代此函数。
 
     Args:
         logger: 日志记录器
         exc: 异常对象
         message: 日志消息前缀
     """
-    import traceback
-    logger.error(f"{message}: {exc.__class__.__name__}: {str(exc)}")
-    logger.debug(f"异常详情:\n{''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))}")
+    from jms_sync.utils.exceptions import handle_exception
+    handle_exception(exc, logger)
 
 
-def init_default_logging():
-    """初始化默认日志配置"""
+def init_default_logging(env_aware: bool = True):
+    """
+    初始化默认日志配置，从配置文件获取日志设置
+    
+    Args:
+        env_aware: 是否启用环境感知
+    """
+    config = get_global_config()
+    
+    if config:
+        # 从配置文件获取日志配置
+        log_config = config.get('log', {})
+        log_level = log_config.get('level')
+        log_file = log_config.get('file')
+        max_bytes = log_config.get('max_size', DEFAULT_MAX_BYTES) * 1024 * 1024  # 配置中以MB为单位
+        backup_count = log_config.get('backup_count', DEFAULT_BACKUP_COUNT)
+        json_format = log_config.get('json_format', False)
+        detailed = log_config.get('detailed', False)
+        separate_error_log = log_config.get('separate_error_log', True)
+    else:
+        # 兼容模式：如果没有配置对象，则使用默认值或环境变量
+        log_level = os.environ.get("LOG_LEVEL")
+        log_file = os.environ.get("LOG_FILE")
+        max_bytes = DEFAULT_MAX_BYTES
+        backup_count = DEFAULT_BACKUP_COUNT
+        json_format = os.environ.get("JSON_LOGS", "").lower() in ("true", "1", "yes")
+        detailed = os.environ.get("DETAILED_LOGS", "").lower() in ("true", "1", "yes")
+        separate_error_log = True
+    
+    # 设置日志记录器
     setup_logger(
-        level=os.environ.get("LOG_LEVEL", "INFO"),
-        log_file=os.environ.get("LOG_FILE"),
-        structured=True
-    ) 
+        log_level=log_level,
+        log_file=log_file,
+        max_bytes=max_bytes,
+        backup_count=backup_count,
+        json_format=json_format,
+        detailed=detailed,
+        env_aware=env_aware,
+        separate_error_log=separate_error_log
+    )

@@ -14,8 +14,9 @@ import json
 from typing import Dict, Any
 
 from jms_sync.sync.sync_manager import SyncManager
-from jms_sync.utils.logger import setup_logger
+from jms_sync.utils.logger import setup_logger, set_global_config, init_default_logging
 from jms_sync.utils.exceptions import JmsSyncError
+from jms_sync.config import load_config
 
 def parse_args():
     """
@@ -80,38 +81,12 @@ def main():
     # 解析命令行参数
     args = parse_args()
     
-    # 获取root logger
+    # 创建临时控制台日志，用于初始日志记录
     logger = logging.getLogger()
-    
-    # 确保日志目录存在
-    if args.log_file:
-        log_dir = os.path.dirname(args.log_file)
-        if log_dir and not os.path.exists(log_dir):
-            os.makedirs(log_dir, exist_ok=True)
-    
-    # 设置日志级别
-    log_level = args.log_level.upper()
-    if log_level not in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']:
-        logger.warning(f"无效的日志级别: {log_level}，将使用INFO")
-        log_level = 'INFO'
-    logger.setLevel(getattr(logging, log_level))
-    
-    # 设置日志格式
-    log_format = logging.Formatter(
-        fmt='%(asctime)s [%(levelname)s] [%(name)s:%(lineno)d] - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    
-    # 添加控制台处理器
+    logger.setLevel(logging.INFO)
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(log_format)
+    console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] - %(message)s', '%Y-%m-%d %H:%M:%S'))
     logger.addHandler(console_handler)
-    
-    # 添加文件处理器（如果指定了日志文件）
-    if args.log_file:
-        file_handler = logging.FileHandler(args.log_file, encoding='utf-8')
-        file_handler.setFormatter(log_format)
-        logger.addHandler(file_handler)
     
     # 记录开始信息
     logger.info(f"JMS-Sync 开始运行")
@@ -123,8 +98,26 @@ def main():
             logger.error(f"配置文件不存在: {args.config}")
             sys.exit(1)
             
+        # 加载配置文件
+        try:
+            config = load_config(args.config)
+            logger.info("配置文件加载成功")
+            
+            # 设置全局配置对象，供日志模块使用
+            set_global_config(config)
+            
+            # 初始化日志配置，现在将从配置文件获取设置
+            init_default_logging()
+            
+            # 重新获取logger，现在已经应用了配置文件的设置
+            logger = logging.getLogger()
+            
+        except Exception as e:
+            logger.error(f"配置文件加载失败: {str(e)}")
+            sys.exit(1)
+            
         # 创建同步管理器
-        sync_manager = SyncManager(args.config)
+        sync_manager = SyncManager(config)
         
         # 运行同步管理器
         start_time = time.time()

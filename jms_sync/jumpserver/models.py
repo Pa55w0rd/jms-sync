@@ -15,6 +15,7 @@ class AssetInfo:
     id: Optional[str] = None
     name: str = ""
     ip: str = ""
+    address: str = ""  # 添加address字段，与JumpServer API保持一致
     platform: str = "Linux"  # "Linux" 或 "Windows"
     protocol: str = "ssh"    # "ssh" 或 "rdp"
     port: int = 22
@@ -30,6 +31,16 @@ class AssetInfo:
     attrs: Dict[str, Any] = field(default_factory=dict)
     accounts: List[Dict[str, Any]] = field(default_factory=list)  # 添加accounts字段支持账号模板
     
+    def __post_init__(self):
+        """
+        初始化后处理
+        确保address和ip字段同步
+        """
+        if not self.address and self.ip:
+            self.address = self.ip
+        elif not self.ip and self.address:
+            self.ip = self.address
+
     def __hash__(self) -> int:
         """
         计算哈希值，使AssetInfo可以作为字典的键或集合的元素
@@ -72,7 +83,7 @@ class AssetInfo:
         """
         data = {
             "name": self.name,
-            "ip": self.ip,
+            "address": self.address or self.ip,  # 优先使用address，兼容旧版本
             "platform": self.platform,
             "protocol": self.protocol,
             "port": self.port,
@@ -110,10 +121,19 @@ class AssetInfo:
         Returns:
             AssetInfo: 资产信息对象
         """
+        # 处理address和ip字段兼容性
+        ip = data.get("ip", "")
+        address = data.get("address", "")
+        if not address and ip:
+            address = ip
+        elif not ip and address:
+            ip = address
+        
         asset = cls(
             id=data.get("id"),
             name=data.get("name", ""),
-            ip=data.get("ip", ""),
+            ip=ip,
+            address=address,
             platform=data.get("platform", "Linux"),
             protocol=data.get("protocol", "ssh"),
             port=data.get("port", 22),
@@ -245,6 +265,7 @@ class NodeInfo:
 class SyncResult:
     """同步结果数据类"""
     total: int = 0
+    expected_total: int = 0  # 添加API返回的预期总数
     success: bool = True
     failed: int = 0
     skipped: int = 0
@@ -253,6 +274,8 @@ class SyncResult:
     deleted: int = 0
     errors: List[Dict[str, Any]] = field(default_factory=list)
     duration: float = 0.0
+    duration_str: str = "0.00秒"
+    error_message: str = ""  # 添加错误信息字段
     
     def __hash__(self) -> int:
         """
@@ -264,13 +287,15 @@ class SyncResult:
         # 使用不可变属性计算哈希值
         return hash((
             self.total, 
+            self.expected_total,
             self.success, 
             self.failed, 
             self.skipped, 
             self.created, 
             self.updated, 
             self.deleted, 
-            self.duration
+            self.duration,
+            self.error_message
         ))
     
     def __eq__(self, other) -> bool:
@@ -289,13 +314,15 @@ class SyncResult:
         # 比较关键属性
         return (
             self.total == other.total and
+            self.expected_total == other.expected_total and
             self.success == other.success and
             self.failed == other.failed and
             self.skipped == other.skipped and
             self.created == other.created and
             self.updated == other.updated and
             self.deleted == other.deleted and
-            self.duration == other.duration
+            self.duration == other.duration and
+            self.error_message == other.error_message
         )
     
     def to_dict(self) -> Dict[str, Any]:
@@ -307,6 +334,7 @@ class SyncResult:
         """
         return {
             "total": self.total,
+            "expected_total": self.expected_total,
             "success": self.success,
             "failed": self.failed,
             "skipped": self.skipped,
@@ -314,20 +342,27 @@ class SyncResult:
             "updated": self.updated,
             "deleted": self.deleted,
             "errors": self.errors,
-            "duration": f"{self.duration:.2f}秒"
+            "duration": self.duration_str or f"{self.duration:.2f}秒",
+            "error_message": self.error_message
         }
     
-    def add_error(self, asset_ip: str, error_message: str, details: Optional[Dict[str, Any]] = None) -> None:
+    def add_error(self, asset_ip: str, error_message: str, operation: str = "unknown", asset_name: str = "", instance_id: str = "", details: Optional[Dict[str, Any]] = None) -> None:
         """
         添加错误信息。
         
         Args:
             asset_ip: 资产IP
             error_message: 错误消息
+            operation: 操作类型（create/update/delete）
+            asset_name: 资产名称
+            instance_id: 实例ID
             details: 错误详情
         """
         error = {
             "asset_ip": asset_ip,
+            "asset_name": asset_name,
+            "instance_id": instance_id,
+            "operation": operation,
             "message": error_message,
             "timestamp": datetime.now().isoformat()
         }

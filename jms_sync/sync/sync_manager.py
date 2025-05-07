@@ -14,53 +14,19 @@
 import os
 import time
 import json
-import uuid
 import logging
-import threading
-from typing import Dict, List, Any, Optional, Tuple, Union, Callable
-from dataclasses import dataclass, field
-from functools import wraps
-from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional, Union
+from datetime import datetime
 
 from jms_sync.config import Config, load_config
 from jms_sync.jumpserver.client import JumpServerClient
 from jms_sync.jumpserver.models import AssetInfo, NodeInfo, SyncResult
 from jms_sync.cloud.aliyun import AliyunCloud
 from jms_sync.cloud.huawei import HuaweiCloud
-from jms_sync.sync.operations import CloudAssetOperation, AssetSynchronizer
+from jms_sync.sync.asset_sync import AssetSyncManager
 from jms_sync.utils.exceptions import JmsSyncError, CloudError, JumpServerError
-from jms_sync.utils.logger import get_logger, StructuredLogger
+from jms_sync.utils.logger import get_logger, set_global_config
 from jms_sync.utils.notifier import NotificationManager
-
-
-def timed(func):
-    """
-    计时装饰器，用于统计函数执行时间
-    
-    Args:
-        func: 待装饰的函数
-        
-    Returns:
-        装饰后的函数
-    """
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        start_time = time.time()
-        result = func(*args, **kwargs)
-        end_time = time.time()
-        
-        # 获取函数名称
-        func_name = func.__name__
-        
-        # 计算执行时间
-        elapsed_time = end_time - start_time
-        
-        # 记录日志
-        logging.debug(f"性能: {func_name} 执行时间: {elapsed_time:.2f}秒")
-        
-        return result
-    return wrapper
-
 
 class CloudClientFactory:
     """
@@ -68,16 +34,16 @@ class CloudClientFactory:
     """
     
     @staticmethod
-    def create(cloud_config: Dict[str, Any], cache_storage=None) -> Optional["CloudClient"]:
+    def create(cloud_config: Dict[str, Any]) -> Optional["CloudClient"]:
         """
         根据配置创建云平台客户端
         
         Args:
             cloud_config: 云平台配置
-            cache_storage: 缓存存储
             
         Returns:
             CloudClient: 云平台客户端
+            
         """
         cloud_type = cloud_config.get('type', '')
         
@@ -116,9 +82,6 @@ class SyncManager:
             'whitelist': [],
             'protected_ips': [],
             'no_delete': False,
-            'parallel_workers': 5,
-            'retry_count': 3,
-            'retry_interval': 5,
         },
         'clouds': []
     }
@@ -139,12 +102,20 @@ class SyncManager:
             try:
                 self.config = load_config(config)
                 self.logger.debug(f"成功从文件加载配置: {config}")
+                
+                # 设置全局配置对象，供其他模块使用
+                set_global_config(self.config)
+                
             except Exception as e:
                 error_msg = f"从配置文件加载配置失败: {str(e)}"
                 self.logger.error(error_msg, exc_info=True)
                 raise JmsSyncError(error_msg)
         else:
             self.config = config
+            
+            # 如果传入的是Config对象，设置为全局配置
+            if isinstance(self.config, Config):
+                set_global_config(self.config)
         
         # 确保config是字典类型或Config类型
         if not isinstance(self.config, (dict, Config)):
@@ -169,21 +140,17 @@ class SyncManager:
         
         # 获取同步配置
         self.sync_config = self.config.get('sync', {})
-        self.parallel_workers = self.sync_config.get('parallel_workers', 5)
-        self.batch_size = self.sync_config.get('batch_size', 20)
-        self.cache_ttl = self.sync_config.get('cache_ttl', 3600)
-        
-        # 获取所有支持的云平台类型
-        self.cloud_types = []
-        clouds_config = self.config.get('clouds', [])
         
         # 初始化云平台客户端
         self.clouds = {}  # 云平台客户端字典
-        self._init_cloud_clients(clouds_config)
+        self._init_cloud_clients(self.config.get('clouds', []))
         
         # 初始化通知管理器
         notification_config = self.config.get('notification', {})
         self.notifier = NotificationManager(notification_config)
+        
+        # 初始化资产同步管理器
+        self.asset_sync_manager = AssetSyncManager(self.js_client, logger=self.logger)
         
         self.logger.info("同步管理器初始化完成")
     
@@ -197,7 +164,6 @@ class SyncManager:
                 cloud_name = cloud_config.get('name', '')
                 self.clouds[f"{cloud_type}-{cloud_name}"] = self._init_cloud_client(cloud_config)
     
-    @timed
     def _init_cloud_client(self, cloud_config: Dict[str, Any]) -> Union[AliyunCloud, HuaweiCloud]:
         """
         初始化云平台客户端
@@ -223,7 +189,6 @@ class SyncManager:
             self.logger.error(error_msg)
             raise JmsSyncError(error_msg)
     
-    @timed
     def run(self) -> Dict[str, Any]:
         """
         运行同步管理器，同步所有云平台资产。
@@ -233,14 +198,6 @@ class SyncManager:
         """
         start_time = time.time()
         self.logger.info("开始同步云平台资产到JumpServer")
-        
-        # 初始化性能指标
-        self.performance_metrics = {
-            'cloud_client_init': [],
-            'assets_fetch_time': {},
-            'sync_time': {},
-            'total_duration': 0
-        }
         
         # 同步结果
         sync_results = {}
@@ -281,30 +238,10 @@ class SyncManager:
                     try:
                         self.logger.info(f"开始同步云平台: {cloud_name}")
                         
-                        # 获取云平台资产
-                        cloud_client = self.clouds.get(f"{cloud_type}-{cloud_name}")
-                        if not cloud_client:
-                            self.logger.error(f"云平台客户端初始化失败: {cloud_type}-{cloud_name}")
-                            sync_results[f"{cloud_type}-{cloud_name}"] = {
-                                'success': False,
-                                'error': "客户端初始化失败",
-                                'created': 0,
-                                'updated': 0,
-                                'failed': 0
-                            }
-                            continue
-                        
-                        # 直接同步资产，避免重复获取资产
+                        # 获取云平台资产并同步到JumpServer
                         sync_start = time.time()
                         result = self.sync_cloud_to_jms(cloud_type, cloud_name)
                         sync_end = time.time()
-                        self.performance_metrics['sync_time'][f"{cloud_type}-{cloud_name}"] = {
-                            "duration": sync_end - sync_start,
-                            "assets_total": getattr(result, 'total', 0),
-                            "created": result.created,
-                            "updated": result.updated,
-                            "deleted": result.deleted if hasattr(result, 'deleted') else 0
-                        }
                         
                         # 更新整体结果
                         sync_results[f"{cloud_type}-{cloud_name}"] = result
@@ -320,7 +257,7 @@ class SyncManager:
                         }
             
             # 记录总耗时
-            self.performance_metrics['total_duration'] = time.time() - start_time
+            total_duration = time.time() - start_time
             
             # 汇总结果
             overall_result = {
@@ -328,18 +265,10 @@ class SyncManager:
                 'error': None,
                 'message': "同步完成",
                 'results': sync_results,
-                'performance': {
-                    'total_duration': f"{self.performance_metrics['total_duration']:.2f}秒",
-                    'client_init_avg': self._calculate_avg_duration('cloud_client_init'),
-                    'assets_fetch_avg': self._calculate_avg_duration('assets_fetch_time'),
-                    'sync_avg': self._calculate_avg_duration('sync_time')
-                }
+                'duration': f"{total_duration:.2f}秒"
             }
             
-            # 输出性能指标
-            self._log_performance_metrics()
-            
-            self.logger.info(f"同步完成，总耗时: {self.performance_metrics['total_duration']:.2f}秒")
+            self.logger.info(f"同步完成，总耗时: {total_duration:.2f}秒")
             return overall_result
             
         except Exception as e:
@@ -351,71 +280,6 @@ class SyncManager:
                 'results': sync_results,
                 'duration': f"{time.time() - start_time:.2f}秒"
             }
-    
-    def _log_performance_metrics(self):
-        """
-        记录性能指标
-        """
-        self.logger.info("--- 性能指标 ---")
-        
-        # 总耗时
-        self.logger.info(f"总耗时: {self.performance_metrics['total_duration']:.2f}秒")
-        
-        # 客户端初始化性能
-        for metric in self.performance_metrics.get('cloud_client_init', []):
-            duration = metric.get('duration', 0)
-            name = metric.get('cloud', '')
-            self.logger.info(f"云平台 {name} 客户端初始化: {duration:.2f}秒")
-        
-        # 资产同步性能（包含获取和处理）
-        for cloud_name, metric_data in self.performance_metrics.get('sync_time', {}).items():
-            if isinstance(metric_data, dict):
-                assets_total = metric_data.get('assets_total', 0)
-                duration = metric_data.get('duration', 0)
-                created = metric_data.get('created', 0)
-                updated = metric_data.get('updated', 0)
-                deleted = metric_data.get('deleted', 0)
-                speed = assets_total / duration if duration > 0 and assets_total > 0 else 0
-                self.logger.info(
-                    f"云平台 {cloud_name} 同步: {duration:.2f}秒, "
-                    f"共{assets_total}个资产 (创建{created}, 更新{updated}, 删除{deleted}), "
-                    f"速率: {speed:.1f}个/秒"
-                )
-    
-    def _calculate_avg_duration(self, metric_name: str) -> str:
-        """
-        计算平均持续时间
-        
-        Args:
-            metric_name: 指标名称
-            
-        Returns:
-            str: 格式化的平均持续时间
-        """
-        metrics_dict = self.performance_metrics.get(metric_name, {})
-        if not metrics_dict:
-            return "0.00秒"
-            
-        # 从字典中提取duration值
-        durations = []
-        for key in metrics_dict:
-            value = metrics_dict[key]
-            # 检查value是否为字典类型
-            if isinstance(value, dict):
-                durations.append(value.get('duration', 0))
-            elif isinstance(value, (int, float)):
-                # 如果是数值，直接使用
-                durations.append(value)
-            else:
-                self.logger.warning(f"性能指标中的值类型不正确: {key}={value} (类型: {type(value).__name__})")
-                continue
-                
-        if not durations:
-            return "0.00秒"
-            
-        total_duration = sum(durations)
-        avg_duration = total_duration / len(durations)
-        return f"{avg_duration:.2f}秒"
     
     def run_with_retry(self, max_retries: int = 3, retry_interval: int = 5) -> Dict[str, Any]:
         """
@@ -480,10 +344,9 @@ class SyncManager:
             "duration": "0.00秒"
         }
 
-    @timed
     def sync_cloud_to_jms(self, cloud_type: str, cloud_name: str) -> SyncResult:
         """
-        将云平台资产同步到JumpServer
+        同步指定云平台的资产到JumpServer
         
         Args:
             cloud_type: 云平台类型
@@ -492,115 +355,535 @@ class SyncManager:
         Returns:
             SyncResult: 同步结果
         """
-        # 记录开始时间
         start_time = time.time()
         
-        # 获取云平台客户端
+        self.logger.info(f"开始同步云平台资产: {cloud_type}/{cloud_name}")
+        # 初始化云客户端实例
         cloud_client = self.clouds.get(f"{cloud_type}-{cloud_name}")
         if not cloud_client:
-            error_msg = f"找不到云平台客户端: {cloud_type}-{cloud_name}"
+            error_msg = f"云平台客户端不存在: {cloud_type}-{cloud_name}"
             self.logger.error(error_msg)
             return SyncResult(
                 success=False,
-                created=0,
-                updated=0,
-                failed=0,
-                duration=time.time() - start_time
-            )
-        
-        # 获取云平台配置
-        clouds = self.config.get('clouds', [])
-        cloud_config = None
-        for cfg in clouds:
-            if cfg.get('type') == cloud_type and cfg.get('name') == cloud_name:
-                cloud_config = cfg
-                break
-                
-        if not cloud_config:
-            error_msg = f"找不到云平台配置: {cloud_type}-{cloud_name}"
-            self.logger.error(error_msg)
-            return SyncResult(
-                success=False,
-                created=0,
-                updated=0,
-                failed=0,
-                duration=time.time() - start_time
-            )
-        
-        created_assets = []
-        deleted_assets = []
-        
-        try:
-            # 创建资产操作类
-            cloud_operator = CloudAssetOperation(
-                cloud_client=cloud_client,
-                js_client=self.js_client,
-                config=cloud_config,
-                cache_ttl=self.cache_ttl,
-                logger=self.logger
-            )
-            
-            # 获取云平台资产
-            self.logger.info(f"开始获取云平台 {cloud_type}-{cloud_name} 资产...")
-            cloud_assets = cloud_operator.get_cloud_assets()
-            self.logger.info(f"成功获取云平台 {cloud_type}-{cloud_name} 资产: {len(cloud_assets)}个")
-            
-            # 全量同步
-            self.logger.info(f"全量同步: 将同步所有{len(cloud_assets)}个资产")
-            
-            # 资产同步器 - 资产的创建、更新和删除逻辑由AssetSynchronizer处理
-            synchronizer = AssetSynchronizer(
-                js_client=self.js_client,
-                parallel_workers=self.parallel_workers,
-                batch_size=self.batch_size,
-                logger=self.logger,
-                cloud_config=cloud_config
-            )
-            
-            # 执行同步
-            result = synchronizer.sync_assets(cloud_assets, cloud_type)
-            
-            # 记录资产变更详情用于通知
-            created_assets = getattr(synchronizer, 'created_assets', [])
-            deleted_assets = getattr(synchronizer, 'deleted_assets', [])
-            
-            # 记录同步耗时
-            end_time = time.time()
-            result.duration = end_time - start_time
-            
-            # 发送通知
-            if hasattr(self, 'notifier'):
-                self.logger.info("发送资产变更通知...")
-                try:
-                    success = self.notifier.notify_asset_changes(
-                        sync_result=result.to_dict(),
-                        platform=cloud_type,
-                        cloud_name=cloud_name,
-                        created_assets=created_assets,
-                        deleted_assets=deleted_assets
-                    )
-                    if success:
-                        self.logger.info("资产变更通知发送成功")
-                    else:
-                        self.logger.warning("资产变更通知发送失败或没有配置通知")
-                except Exception as e:
-                    self.logger.error(f"发送资产变更通知时发生错误: {e}", exc_info=True)
-            
-            return result
-            
-        except Exception as e:
-            # 记录异常
-            self.logger.error(f"同步资产时发生错误: {e}", exc_info=True)
-            
-            # 创建错误结果
-            result = SyncResult(
-                success=False,
-                failed=1,
+                total=0,
                 created=0,
                 updated=0,
                 deleted=0,
-                duration=time.time() - start_time
+                duration=0,
+                error_message=error_msg
             )
-            result.add_error("N/A", str(e))
+        
+        # 同步结果初始化
+        sync_result = SyncResult(
+            success=True,
+            total=0,
+            created=0,
+            updated=0,
+            deleted=0,
+            duration=0,
+            error_message=""
+        )
+        
+        try:
+            # 1. 获取云平台配置
+            clouds = self.config.get('clouds', [])
+            cloud_config = None
+            for cloud in clouds:
+                if cloud.get('type') == cloud_type and cloud.get('name') == cloud_name:
+                    cloud_config = cloud
+                    break
+                    
+            if not cloud_config:
+                error_msg = f"未找到云平台配置: {cloud_type}/{cloud_name}"
+                self.logger.error(error_msg)
+                sync_result.success = False
+                sync_result.error_message = error_msg
+                return sync_result
+                
+            # 2. 获取云平台所有区域实例
+            regions = cloud_config.get('regions', [])
+            self.logger.info(f"需要同步的区域: {regions}")
             
-            return result 
+            # 3. 获取所有区域的实例信息
+            all_instances = []
+            api_total_count = 0  # 记录API返回的实例总数
+            for region in regions:
+                try:
+                    self.logger.info(f"获取区域 {region} 的实例信息")
+                    # 修复：先设置区域，再调用无参数的get_instances()方法
+                    if cloud_type == 'aliyun' or cloud_type == '阿里云':
+                        # 阿里云客户端需要先切换区域
+                        cloud_client.set_region(region)
+                        instances = cloud_client.get_instances()
+                    elif cloud_type == 'huawei' or cloud_type == '华为云':
+                        # 华为云客户端需要先切换区域
+                        cloud_client.set_region(region)
+                        instances = cloud_client.get_instances()
+                    else:
+                        self.logger.warning(f"未知的云平台类型: {cloud_type}")
+                        instances = []
+                        
+                    self.logger.info(f"区域 {region} 中发现 {len(instances)} 个实例")
+                    
+                    # 记录API返回的总数
+                    if instances and len(instances) > 0 and 'total_count' in instances[0]:
+                        current_total = instances[0].get('total_count', 0)
+                        self.logger.debug(f"区域 {region} API返回总数: {current_total}")
+                        api_total_count += current_total
+                    
+                    # 处理每个实例，使其规范化为标准格式
+                    processed_instances = []
+                    for instance in instances:
+                        try:
+                            # 处理云平台实例，转换为标准格式的字典
+                            processed = self._process_cloud_instance(instance, cloud_type, region)
+                            if processed:
+                                processed_instances.append(processed)
+                            else:
+                                self.logger.warning(f"处理实例失败: {instance.get('instance_id', 'unknown')}")
+                        except Exception as e:
+                            self.logger.error(f"处理实例时发生错误: {str(e)}")
+                    
+                    all_instances.extend(processed_instances)
+                except Exception as e:
+                    self.logger.error(f"获取区域 {region} 实例信息失败: {str(e)}")
+            
+            # 保存处理后的实例总数
+            sync_result.total = len(all_instances)
+            
+            # 检查API返回总数与实际获取数量是否匹配
+            if api_total_count > 0 and sync_result.total != api_total_count:
+                warning_msg = f"实例数量不匹配，跳过同步操作: API返回总数={api_total_count}, 实际获取数量={sync_result.total}"
+                self.logger.warning(warning_msg)
+                
+                # 设置结果
+                sync_result.success = False
+                sync_result.error_message = warning_msg
+                
+                # 添加到结果中
+                sync_result.expected_total = api_total_count
+                
+                # 发送通知
+                try:
+                    result_dict = sync_result.to_dict()
+                    result_dict["update_reasons"] = []
+                    self.notifier.notify_asset_changes(
+                        sync_result=result_dict,
+                        platform=cloud_type,
+                        cloud_name=cloud_name,
+                        created_assets=[],
+                        deleted_assets=[],
+                        is_failure=True
+                    )
+                except Exception as e:
+                    self.logger.error(f"发送数量不匹配通知失败: {str(e)}")
+                
+                # 直接返回结果，不继续同步
+                return sync_result
+            else:
+                sync_result.expected_total = api_total_count
+            
+            self.logger.info(f"共获取并处理了 {sync_result.total} 个实例 (API返回总数: {api_total_count})")
+            
+            # 4. 如果没有获取到任何实例，则中止同步
+            if not all_instances:
+                warning_msg = f"未获取到任何实例信息，中止同步 - 云平台：{cloud_type}/{cloud_name}，区域：{regions}"
+                self.logger.warning(warning_msg)
+                sync_result.success = True  # 没有实例也视为成功，但不需要进行后续操作
+                sync_result.error_message = warning_msg
+                
+                # 即使没有实例也发送通知，以便管理员了解情况
+                try:
+                    result_dict = sync_result.to_dict()
+                    result_dict["update_reasons"] = []
+                    self.notifier.notify_asset_changes(
+                        sync_result=result_dict,
+                        platform=cloud_type,
+                        cloud_name=cloud_name,
+                        created_assets=[],
+                        deleted_assets=[],
+                        is_failure=True  # 将这种情况视为需要通知的"失败"
+                    )
+                except Exception as e:
+                    self.logger.error(f"发送无实例通知失败: {str(e)}")
+                
+                return sync_result
+                
+            # 5. 只有在成功获取云平台资产后，才获取或创建JumpServer节点
+            node_id = self._get_or_create_cloud_node(cloud_type, cloud_name)
+            if not node_id:
+                error_msg = f"创建或获取JumpServer节点失败: {cloud_type}/{cloud_name}"
+                self.logger.error(error_msg)
+                sync_result.success = False
+                sync_result.error_message = error_msg
+                
+                # 即使节点创建失败也发送通知
+                try:
+                    result_dict = sync_result.to_dict()
+                    result_dict["update_reasons"] = []
+                    self.notifier.notify_asset_changes(
+                        sync_result=result_dict,
+                        platform=cloud_type,
+                        cloud_name=cloud_name,
+                        created_assets=[],
+                        deleted_assets=[],
+                        is_failure=True
+                    )
+                except Exception as e:
+                    self.logger.error(f"发送节点创建失败通知失败: {str(e)}")
+                
+                return sync_result
+                
+            # 6. 同步配置
+            sync_options = self.config.get('sync', {})
+            no_delete = sync_options.get('no_delete', False)
+            protected_ips = sync_options.get('protected_ips', [])
+            self.logger.info(f"同步选项: no_delete={no_delete}, 受保护IP数量={len(protected_ips)}")
+            
+            # 7. 执行资产同步
+            assets_result = self.asset_sync_manager.sync_assets(
+                cloud_assets=all_instances,
+                node_id=node_id,
+                cloud_type=cloud_type,
+                cloud_name=cloud_name,
+                no_delete=no_delete,
+                protected_ips=protected_ips
+            )
+            
+            # 8. 整合同步结果
+            sync_result.created = assets_result.get('created', 0)
+            sync_result.updated = assets_result.get('updated', 0)
+            sync_result.deleted = assets_result.get('deleted', 0)
+            sync_result.skipped = assets_result.get('skipped', 0)
+            sync_result.failed = assets_result.get('failed', 0)
+            
+            # 获取变更详情
+            created_assets = self.asset_sync_manager.created_assets
+            updated_assets = self.asset_sync_manager.updated_assets
+            deleted_assets = self.asset_sync_manager.deleted_assets
+            failed_operations = assets_result.get('errors', [])
+            
+            if failed_operations:
+                sync_result.errors = failed_operations
+                
+        except Exception as e:
+            self.logger.exception(f"同步云平台资产到JumpServer时发生错误: {str(e)}")
+            sync_result.success = False
+            sync_result.error_message = f"同步过程中发生异常: {str(e)}"
+            
+        # 计算总耗时
+        end_time = time.time()
+        duration = end_time - start_time
+        sync_result.duration = duration
+        sync_result.duration_str = f"{duration:.2f}秒"
+        
+        # 记录同步结果
+        self.logger.info(f"同步完成: 总计={sync_result.total}, "
+                       f"创建={sync_result.created}, "
+                       f"更新={sync_result.updated}, "
+                       f"删除={sync_result.deleted}, "
+                       f"跳过={sync_result.skipped}, "
+                       f"失败={sync_result.failed}, "
+                       f"耗时={sync_result.duration_str}")
+        
+        # 发送通知
+        try:
+            # 通知处理完成的结果
+            created_assets = self.asset_sync_manager.created_assets
+            updated_assets = self.asset_sync_manager.updated_assets
+            deleted_assets = self.asset_sync_manager.deleted_assets
+            update_reasons = self.asset_sync_manager.update_reasons
+            
+            # 将更新原因添加到同步结果中
+            result_dict = sync_result.to_dict()
+            result_dict["update_reasons"] = update_reasons
+            
+            self.notifier.notify_asset_changes(
+                sync_result=result_dict,
+                platform=cloud_type,
+                cloud_name=cloud_name,
+                created_assets=created_assets,
+                deleted_assets=deleted_assets,
+                is_failure=not sync_result.success
+            )
+        except Exception as e:
+            self.logger.error(f"发送通知失败: {str(e)}")
+        
+        return sync_result
+
+    def _get_or_create_cloud_node(self, cloud_type: str, cloud_name: str) -> str:
+        """
+        获取或创建云平台节点，按照文档要求创建三级节点结构
+        
+        Args:
+            cloud_type: 云平台类型（二级节点名称）
+            cloud_name: 云平台名称（三级节点名称）
+            
+        Returns:
+            str: 三级节点ID，失败返回空字符串
+        """
+        try:
+            # 通过完整路径获取或创建节点
+            path = f"/DEFAULT/{cloud_type}/{cloud_name}"
+            self.logger.info(f"获取或创建节点: {path}")
+            
+            # 使用node_manager管理节点
+            if hasattr(self.js_client, 'node_manager'):
+                # 初始化节点结构
+                self.js_client.node_manager.init_nodes(cloud_type, cloud_name)
+                
+                # 获取三级节点ID
+                node_path = f"/DEFAULT/{cloud_type}/{cloud_name}"
+                node = self.js_client.node_manager.get_node_by_path(node_path)
+                
+                if node:
+                    self.logger.info(f"成功获取节点: {node_path}, ID={node['id']}")
+                    return node['id']
+                else:
+                    self.logger.error(f"无法获取节点: {node_path}")
+                    return ""
+            else:
+                self.logger.error("JumpServer客户端没有node_manager属性")
+                return ""
+                
+        except Exception as e:
+            self.logger.error(f"获取或创建云平台节点失败: {e}", exc_info=True)
+            return ""
+            
+    def _process_cloud_instance(self, instance: Dict[str, Any], cloud_type: str, region: str) -> Optional[Dict[str, Any]]:
+        """
+        处理云平台实例，转换为标准格式
+        
+        Args:
+            instance: 云平台实例
+            cloud_type: 云平台类型
+            region: 区域
+            
+        Returns:
+            Optional[Dict[str, Any]]: 处理后的实例信息，失败返回None
+        """
+        try:
+            # 提取实例ID
+            instance_id = self._extract_instance_id(instance)
+            if not instance_id:
+                self.logger.warning("无法获取实例ID，跳过")
+                return None
+                
+            # 提取IP地址
+            ip = self._extract_instance_ip(instance)
+            if not ip:
+                self.logger.warning(f"实例 {instance_id} 没有可用的IP地址，跳过")
+                return None
+                
+            # 提取实例名称
+            instance_name = self._extract_instance_name(instance)
+            if not instance_name:
+                instance_name = f"{cloud_type}-{instance_id}"
+                
+            # 提取操作系统类型
+            os_type = self._extract_os_type(instance)
+            
+            # 构建资产数据
+            asset_data = {
+                'instance_id': instance_id,
+                'instance_name': instance_name,
+                'hostname': instance_name,
+                'ip': ip,
+                'address': ip,
+                'os_type': os_type,
+                'region': region,
+                'cloud_type': cloud_type,
+            }
+            
+            # 提取额外信息
+            vpc_id = self._extract_vpc_id(instance)
+            if vpc_id:
+                asset_data['vpc_id'] = vpc_id
+                
+            instance_type = self._extract_instance_type(instance)
+            if instance_type:
+                asset_data['instance_type'] = instance_type
+                
+            return asset_data
+            
+        except Exception as e:
+            self.logger.error(f"处理云平台实例失败: {e}")
+            return None
+            
+    def _extract_instance_id(self, instance: Dict[str, Any]) -> str:
+        """
+        提取实例ID
+        
+        Args:
+            instance: 实例数据
+            
+        Returns:
+            str: 实例ID
+        """
+        # 尝试从不同字段获取实例ID
+        if 'instance_id' in instance:
+            return instance['instance_id']
+        elif 'id' in instance:
+            return instance['id']
+        elif 'InstanceId' in instance:
+            return instance['InstanceId']
+            
+        # 无法获取实例ID
+        return ""
+        
+    def _extract_instance_ip(self, instance: Dict[str, Any]) -> str:
+        """
+        提取实例IP地址
+        
+        Args:
+            instance: 实例数据
+            
+        Returns:
+            str: 实例IP地址
+        """
+        # 尝试从不同字段获取IP地址
+        if 'ip' in instance:
+            return instance['ip']
+        elif 'private_ip' in instance:
+            return instance['private_ip']
+        elif 'address' in instance:
+            return instance['address']
+            
+        # 处理不同云平台的特殊字段
+        for field_name in ['PrivateIpAddress', 'InnerIpAddress', 'VpcAttributes']:
+            if field_name in instance:
+                if field_name == 'VpcAttributes':
+                    # 处理阿里云的VPC属性中的私有IP
+                    vpc_attrs = instance[field_name]
+                    if isinstance(vpc_attrs, dict) and 'PrivateIpAddress' in vpc_attrs:
+                        private_ips = vpc_attrs['PrivateIpAddress']
+                        if isinstance(private_ips, dict) and 'IpAddress' in private_ips:
+                            ip_list = private_ips['IpAddress']
+                            if isinstance(ip_list, list) and ip_list:
+                                return ip_list[0]
+                else:
+                    # 处理其他类型的IP地址字段
+                    value = instance[field_name]
+                    if isinstance(value, str):
+                        return value
+                    elif isinstance(value, list) and value:
+                        return value[0]
+                    elif isinstance(value, dict) and 'IpAddress' in value:
+                        ip_list = value['IpAddress']
+                        if isinstance(ip_list, list) and ip_list:
+                            return ip_list[0]
+        
+        # 无法获取IP地址
+        return ""
+        
+    def _extract_instance_name(self, instance: Dict[str, Any]) -> str:
+        """
+        提取实例名称
+        
+        Args:
+            instance: 实例数据
+            
+        Returns:
+            str: 实例名称
+        """
+        # 尝试从不同字段获取实例名称
+        if 'instance_name' in instance:
+            return instance['instance_name']
+        elif 'name' in instance:
+            return instance['name']
+        elif 'hostname' in instance:
+            return instance['hostname']
+        elif 'InstanceName' in instance:
+            return instance['InstanceName']
+        elif 'Name' in instance:
+            return instance['Name']
+            
+        # 无法获取实例名称
+        return ""
+        
+    def _extract_os_type(self, instance: Dict[str, Any]) -> str:
+        """
+        提取操作系统类型
+        
+        Args:
+            instance: 实例数据
+            
+        Returns:
+            str: 操作系统类型 ('Linux' 或 'Windows')
+        """
+        # 默认为Linux
+        default_os = 'Linux'
+        
+        # 尝试从不同字段获取操作系统类型
+        if 'os_type' in instance:
+            os_type = instance['os_type']
+            if isinstance(os_type, str) and 'windows' in os_type.lower():
+                return 'Windows'
+        elif 'OSName' in instance:
+            os_name = instance['OSName']
+            if isinstance(os_name, str) and 'windows' in os_name.lower():
+                return 'Windows'
+        elif 'OsName' in instance:
+            os_name = instance['OsName']
+            if isinstance(os_name, str) and 'windows' in os_name.lower():
+                return 'Windows'
+        elif 'os_name' in instance:
+            os_name = instance['os_name']
+            if isinstance(os_name, str) and 'windows' in os_name.lower():
+                return 'Windows'
+                
+        # 尝试从实例名称判断操作系统类型
+        instance_name = self._extract_instance_name(instance)
+        if instance_name and ('windows' in instance_name.lower() or 'win' in instance_name.lower()):
+            return 'Windows'
+            
+        # 使用默认操作系统类型
+        return default_os
+        
+    def _extract_vpc_id(self, instance: Dict[str, Any]) -> str:
+        """
+        提取VPC ID
+        
+        Args:
+            instance: 实例数据
+            
+        Returns:
+            str: VPC ID
+        """
+        # 尝试从不同字段获取VPC ID
+        if 'vpc_id' in instance:
+            return instance['vpc_id']
+        elif 'VpcId' in instance:
+            return instance['VpcId']
+        elif 'VpcAttributes' in instance:
+            vpc_attrs = instance['VpcAttributes']
+            if isinstance(vpc_attrs, dict) and 'VpcId' in vpc_attrs:
+                return vpc_attrs['VpcId']
+                
+        # 无法获取VPC ID
+        return ""
+        
+    def _extract_instance_type(self, instance: Dict[str, Any]) -> str:
+        """
+        提取实例类型
+        
+        Args:
+            instance: 实例数据
+            
+        Returns:
+            str: 实例类型
+        """
+        # 尝试从不同字段获取实例类型
+        if 'instance_type' in instance:
+            return instance['instance_type']
+        elif 'InstanceType' in instance:
+            return instance['InstanceType']
+        elif 'flavor' in instance:
+            flavor = instance['flavor']
+            if isinstance(flavor, dict) and 'id' in flavor:
+                return flavor['id']
+            elif hasattr(flavor, 'id'):
+                return flavor.id
+                
+        # 无法获取实例类型
+        return "" 
